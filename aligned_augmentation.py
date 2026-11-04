@@ -70,6 +70,16 @@ probabilité cp_prob, collage NON INVASIF d'au plus cp_max_patches lésion(s) AV
   * pas de changement de couleur. Les 7 premières copies et tout le naïf restent inchangés.
 Limite : sans masque de segmentation, le patch est rectangulaire et emporte le tissu autour de la lésion.
 
+Catalogue conditionnel aux carences (`swap_classes`, ablation)
+--------------------------------------------------------------
+Pour les images contenant au moins une boîte d'une classe de swap_classes (ex. Mg, N, K), les 2
+transformations de couleur du catalogue sont remplacées par les 2 symétries diagonales de D4 :
+  rgb_shift           -> transpose       (symétrie sur la diagonale principale)
+  brightness_contrast -> anti_transpose  (symétrie sur l'anti-diagonale)
+Ces images ne reçoivent donc AUCUNE transformation de couleur hors-ligne ; les autres images gardent le
+catalogue d'origine. La règle s'applique quel que soit alpha : utilisez-la dans les DEUX bras (naïf et CA).
+S'utilise avec extra_mode="repeat" et combine=False.
+
 Boîtes : format YOLO, min_visibility = 0.2. Une copie qui perd toutes ses boîtes (alors que l'image
 source en avait) est rejetée, comme dans le script naïf d'origine.
 
@@ -113,6 +123,8 @@ TRANSFORM_NAMES = (
     "random_crop",
 )
 GEOMETRIC = ("rotate", "random_rotate90", "horizontal_flip", "vertical_flip", "random_crop")
+# swap_classes : pour les images de carence, couleur -> transpositions de D4 (symétries diagonales)
+COLOR_TO_TRANSPOSE = {"rgb_shift": "transpose", "brightness_contrast": "anti_transpose"}
 COLOR = ("rgb_shift", "brightness_contrast")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 N_SAME_TRANSFORM_RETRIES = 3
@@ -139,6 +151,8 @@ class AlignedAugConfig:
     combine_from_rep: int = 1             # 1 = combiner seulement à partir de la 8e copie
     combine_exclude: tuple = ("rotate",)  # transformations jamais combinées (ni principale ni secondaire)
     extra_mode: str = "repeat"            # copies au-delà de 7 : "repeat" (cycle des 7) ou "d4_affine"
+    swap_classes: tuple = ()              # images contenant ces classes : couleur -> transpositions D4
+                                          # ex. (4, 5, 6) = Mg, N, K. () = désactivé
     affine_rotate: float = 5.0            # d4_affine : rotation ±5° (largest_box : aire des boîtes ≤ ×1,17)
     affine_scale: tuple = (0.9, 1.1)      # d4_affine : échelle (boîtes exactes)
     affine_shear: float = 0.0             # d4_affine : cisaillement (0 = désactivé ; 5° -> aire ×1,18)
@@ -206,6 +220,10 @@ def _single_transform(name: str, img_h: int, img_w: int, cfg: AlignedAugConfig):
         t = A.VerticalFlip(p=1.0)
     elif name == "random_crop":
         t = A.RandomCrop(height=int(img_h * cfg.crop_fraction), width=int(img_w * cfg.crop_fraction), p=1.0)
+    elif name == "transpose":            # symétrie sur la diagonale principale
+        t = A.Transpose(p=1.0)
+    elif name == "anti_transpose":       # symétrie sur l'anti-diagonale = transposition puis rotation de 180°
+        t = [A.Transpose(p=1.0), A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)]
     elif name == EXTRA_D4_AFFINE:
         # D4 (8 symétries du carré, boîtes exactes) puis Affine léger, sans couleur.
         # largest_box (défaut) : la boîte englobe toujours tout l'objet tourné (un peu plus lâche).
@@ -327,13 +345,21 @@ def allocate(weights: np.ndarray, budget: int, k_max: int, rng: random.Random) -
     return k
 
 
-def transform_schedule(stem: str, k: int, seed: int, extra_mode: str = "repeat"):
-    """Liste des (transformation, répétition) pour une image : on parcourt les 7 transformations
-    dans un ordre mélangé propre à l'image, puis, si k > 7 :
+def image_catalog(classes, swap_ids):
+    """Catalogue de 7 transformations d'une image. Si l'image contient une classe de swap_ids
+    (carences), les 2 transformations de couleur sont remplacées par les 2 transpositions de D4."""
+    if swap_ids and set(classes) & swap_ids:
+        return tuple(COLOR_TO_TRANSPOSE.get(t, t) for t in TRANSFORM_NAMES)
+    return TRANSFORM_NAMES
+
+
+def transform_schedule(stem: str, k: int, seed: int, extra_mode: str = "repeat", catalog=TRANSFORM_NAMES):
+    """Liste des (transformation, répétition) pour une image : on parcourt les 7 transformations du
+    catalogue de l'image dans un ordre mélangé propre à l'image, puis, si k > 7 :
       * extra_mode="repeat"    : on recommence le cycle des 7 (défaut) ;
       * extra_mode="d4_affine" : les copies 8..k sont toutes "d4_affine" (répétitions 1..k-7).
     Avec k <= 7 (tout le naïf), le calendrier est identique dans les deux modes."""
-    order = list(TRANSFORM_NAMES)
+    order = list(catalog)
     random.Random(sample_seed(seed, stem, "order", 0, 0)).shuffle(order)
     n = len(order)
     if extra_mode == "d4_affine":
@@ -341,16 +367,20 @@ def transform_schedule(stem: str, k: int, seed: int, extra_mode: str = "repeat")
     return [(order[r % n], r // n) for r in range(k)]
 
 
-def retry_candidates(stem: str, name: str, rep: int, seed: int):
+def retry_candidates(stem: str, name: str, rep: int, seed: int, catalog=TRANSFORM_NAMES):
     """Ordre des essais pour une copie (utilisé seulement si dedupe ou retry_failed) :
     d'abord la transformation prévue, retentée avec de nouvelles graines (corrige par ex. le
     RandomRotate90 qui tire 0°), puis les 6 autres dans un ordre aléatoire propre à la copie
     (pas de biais systématique vers une transformation de repli)."""
     if name == EXTRA_D4_AFFINE:  # transformation continue : de nouvelles graines suffisent
         return [name] * (N_SAME_TRANSFORM_RETRIES + len(TRANSFORM_NAMES))
-    others = [t for t in TRANSFORM_NAMES if t != name]
-    random.Random(sample_seed(seed, stem, name, rep, -1)).shuffle(others)
-    return [name] * N_SAME_TRANSFORM_RETRIES + others
+    others = [t for t in catalog if t != name]
+    rng = random.Random(sample_seed(seed, stem, name, rep, -1))
+    rng.shuffle(others)
+    # derniers recours : les transformations continues du catalogue (toujours une copie nouvelle)
+    continuous = [t for t in catalog if t in ("rotate", "random_crop")] * 5
+    rng.shuffle(continuous)
+    return [name] * N_SAME_TRANSFORM_RETRIES + others + continuous
 
 
 # ----------------------------------------------------------------------------------------------
@@ -492,11 +522,15 @@ def generate(cfg: AlignedAugConfig):
     k_max = cfg.k_max if cfg.alpha > 0 else max(cfg.k_max, math.ceil(budget / n_src))
 
     boost_ids = resolve_boost_classes(cfg.boost_classes, cfg.class_names)
+    swap_ids = resolve_boost_classes(cfg.swap_classes, cfg.class_names)
+    if swap_ids and (cfg.combine or cfg.extra_mode != "repeat"):
+        raise ValueError("swap_classes s'utilise avec extra_mode='repeat' et combine=False.")
     weights, n_img_per_class = image_weights(items, cfg.alpha, boost_ids)
     k = allocate(weights, budget, k_max, rng)
     cp_ctx = (CopyPasteContext(items, boost_ids, n_img_per_class, cfg)
               if cfg.extra_mode == "d4_affine_cp" else None)
     pasted_counts = Counter()
+    n_swapped_images = 0
 
     before = Counter(c for it in items for c in it["classes"])
     after = Counter(before) if cfg.copy_originals else Counter()
@@ -523,8 +557,10 @@ def generate(cfg: AlignedAugConfig):
         seen = {hashlib.md5(img.tobytes()).hexdigest()}
         had_boxes = len(it["bboxes"]) > 0
 
-        for name, rep in transform_schedule(it["stem"], int(k_i), cfg.seed, schedule_mode):
-            candidates = retry_candidates(it["stem"], name, rep, cfg.seed)
+        catalog = image_catalog(it["classes"], swap_ids)
+        n_swapped_images += catalog != TRANSFORM_NAMES
+        for name, rep in transform_schedule(it["stem"], int(k_i), cfg.seed, schedule_mode, catalog):
+            candidates = retry_candidates(it["stem"], name, rep, cfg.seed, catalog)
             written, logged, last_status = False, False, "exhausted"
             for attempt, cand in enumerate(candidates):
                 if attempt > 0 and not (cfg.dedupe or cfg.retry_failed):
@@ -581,6 +617,7 @@ def generate(cfg: AlignedAugConfig):
     summary["pair_counts"] = dict(sorted(pair_counts.items()))
     names_ = cfg.class_names or {}
     summary["pasted_lesions"] = {names_.get(c, str(c)): n for c, n in sorted(pasted_counts.items())}
+    summary["images_with_swapped_catalog"] = n_swapped_images
     _write_reports(cfg, manifest, summary)
     return summary
 
@@ -640,5 +677,7 @@ def print_summary(s):
     print("Transformations :", s["transform_counts"])
     if s.get("pair_counts"):
         print("Combinaisons (principale+secondaire) :", s["pair_counts"])
+    if s.get("images_with_swapped_catalog"):
+        print("Images dont la couleur est remplacée par les transpositions :", s["images_with_swapped_catalog"])
     if s.get("pasted_lesions"):
         print("Lésions collées (copy-paste) :", s["pasted_lesions"])
