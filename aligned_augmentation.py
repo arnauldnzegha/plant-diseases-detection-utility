@@ -60,6 +60,16 @@ rotate_method="largest_box" (la boîte englobe toujours toute la lésion ; aire 
 Les images de 7 copies ou moins (tout le naïf) sont identiques au mode simple.
 Incompatible avec combine=True (deux ablations distinctes).
 
+Variante `extra_mode="d4_affine_cp"` : comme d4_affine, et, sur chaque copie d4_affine, avec la
+probabilité cp_prob, collage NON INVASIF d'au plus cp_max_patches lésion(s) AVANT D4 + Affine :
+  * classe collée = classe ciblée (boost_classes) la plus rare présente dans l'image ;
+  * lésion prise dans une AUTRE image du train (jamais val/test), boîte d'origine découpée ;
+  * même taille relative que dans son image d'origine, côté plafonné à cp_max_rel_size ;
+  * bords fondus (cp_feather) ; aucune superposition avec les boîtes existantes (marge cp_margin) :
+    aucune lésion annotée n'est masquée ; sans place libre, on ne colle rien ;
+  * pas de changement de couleur. Les 7 premières copies et tout le naïf restent inchangés.
+Limite : sans masque de segmentation, le patch est rectangulaire et emporte le tissu autour de la lésion.
+
 Boîtes : format YOLO, min_visibility = 0.2. Une copie qui perd toutes ses boîtes (alors que l'image
 source en avait) est rejetée, comme dans le script naïf d'origine.
 
@@ -134,6 +144,13 @@ class AlignedAugConfig:
     affine_shear: float = 0.0             # d4_affine : cisaillement (0 = désactivé ; 5° -> aire ×1,18)
     affine_rotate_method: str = "largest_box"  # "largest_box" : ne coupe jamais l'objet (boîte plus lâche)
                                                # "ellipse" : boîte serrée mais suppose un objet elliptique
+    # copy-paste léger (extra_mode="d4_affine_cp") — uniquement sur les copies d4_affine
+    cp_prob: float = 0.5                  # probabilité de coller sur une copie d4_affine
+    cp_max_patches: int = 1               # lésions collées au plus par copie
+    cp_max_rel_size: float = 0.25         # côté de la lésion collée ≤ 25 % du côté de l'image
+    cp_feather: float = 0.15              # largeur du fondu des bords (fraction de la taille du patch)
+    cp_margin: float = 0.02               # écart minimal aux boîtes existantes (fraction du grand côté)
+    cp_position_tries: int = 30           # essais de position avant d'abandonner le collage
     copy_originals: bool = True
     dedupe: bool = False
     retry_failed: bool = False
@@ -155,8 +172,11 @@ def build_transform(names, img_h: int, img_w: int, cfg: AlignedAugConfig) -> A.C
     if isinstance(names, str):
         names = (names,)
     ordered = [n for n in names if n in COLOR] + [n for n in names if n not in COLOR]
-    return A.Compose([_single_transform(n, img_h, img_w, cfg) for n in ordered],
-                     bbox_params=_bbox_params(cfg.min_visibility))
+    flat = []
+    for n in ordered:  # liste à plat : un Sequential imbriqué ne reçoit pas la graine de Compose
+        t = _single_transform(n, img_h, img_w, cfg)
+        flat.extend(t if isinstance(t, list) else [t])
+    return A.Compose(flat, bbox_params=_bbox_params(cfg.min_visibility))
 
 
 def secondary_transform(stem: str, name: str, rep: int, attempt: int, cfg) -> str | None:
@@ -189,12 +209,12 @@ def _single_transform(name: str, img_h: int, img_w: int, cfg: AlignedAugConfig):
     elif name == EXTRA_D4_AFFINE:
         # D4 (8 symétries du carré, boîtes exactes) puis Affine léger, sans couleur.
         # largest_box (défaut) : la boîte englobe toujours tout l'objet tourné (un peu plus lâche).
-        t = A.Sequential([
+        t = [
             A.D4(p=1.0),
             A.Affine(rotate=(-cfg.affine_rotate, cfg.affine_rotate), scale=cfg.affine_scale,
                      shear=(-cfg.affine_shear, cfg.affine_shear), rotate_method=cfg.affine_rotate_method,
                      border_mode=cv2.BORDER_CONSTANT, fill=0, p=1.0),
-        ])
+        ]
     else:
         raise ValueError(f"Transformation inconnue : {name}")
     return t
@@ -334,16 +354,125 @@ def retry_candidates(stem: str, name: str, rep: int, seed: int):
 
 
 # ----------------------------------------------------------------------------------------------
+# Copy-paste léger (extra_mode="d4_affine_cp")
+# ----------------------------------------------------------------------------------------------
+class CopyPasteContext:
+    """Index des lésions des classes ciblées (train uniquement) et collage non invasif."""
+
+    def __init__(self, items, boost_ids, n_img_per_class, cfg):
+        self.items, self.cfg = items, cfg
+        self.n_img = n_img_per_class
+        self.targets = set(boost_ids) if boost_ids is not None else set(n_img_per_class)
+        self.pool = defaultdict(list)  # classe -> [(index image, boîte yolo)]
+        for i, it in enumerate(items):
+            for b, c in zip(it["bboxes"], it["classes"]):
+                if c in self.targets:
+                    self.pool[c].append((i, b))
+        self._cache = {}
+
+    def _read(self, i):
+        if i not in self._cache:
+            if len(self._cache) > 64:
+                self._cache.pop(next(iter(self._cache)))
+            im = cv2.imread(os.path.join(self.cfg.images_dir, self.items[i]["name"]))
+            self._cache[i] = None if im is None else cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+        return self._cache[i]
+
+    def target_class(self, it):
+        """Classe ciblée la plus rare présente dans l'image (None si aucune)."""
+        present = [c for c in set(it["classes"]) if c in self.targets and self.pool[c]]
+        return min(present, key=lambda c: self.n_img[c]) if present else None
+
+    def paste(self, img, bboxes, classes, src_index, cls, rng):
+        """Colle au plus cp_max_patches lésions de `cls`. Retourne (img, bboxes, classes, n_collées)."""
+        cfg = self.cfg
+        H, W = img.shape[:2]
+        out = img.copy()
+        boxes_px = [_yolo_to_px(b, W, H) for b in bboxes]
+        margin = cfg.cp_margin * max(H, W)
+        candidates = [e for e in self.pool[cls] if e[0] != src_index]
+        n_done = 0
+        for _ in range(cfg.cp_max_patches):
+            if not candidates:
+                break
+            j, box = rng.choice(candidates)
+            src = self._read(j)
+            if src is None:
+                continue
+            sh, sw = src.shape[:2]
+            x1, y1, x2, y2 = (int(round(v)) for v in _yolo_to_px(box, sw, sh))
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(sw, x2), min(sh, y2)
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            patch = src[y1:y2, x1:x2]
+            # même taille RELATIVE que dans l'image d'origine, plafonnée
+            s = math.hypot(W, H) / math.hypot(sw, sh)
+            s = min(s, cfg.cp_max_rel_size * W / patch.shape[1], cfg.cp_max_rel_size * H / patch.shape[0])
+            pw, ph = int(round(patch.shape[1] * s)), int(round(patch.shape[0] * s))
+            if pw < 6 or ph < 6 or pw >= W or ph >= H:
+                continue
+            patch = cv2.resize(patch, (pw, ph), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+            for _try in range(cfg.cp_position_tries):
+                px, py = rng.randint(0, W - pw), rng.randint(0, H - ph)
+                cand = (px, py, px + pw, py + ph)
+                if all(not _overlap(cand, b, margin) for b in boxes_px):
+                    break
+            else:
+                continue  # aucune place libre : on ne colle pas (non invasif)
+            alpha = _feather_mask(ph, pw, cfg.cp_feather)[..., None]
+            region = out[py:py + ph, px:px + pw].astype(np.float32)
+            out[py:py + ph, px:px + pw] = (alpha * patch + (1 - alpha) * region).round().astype(np.uint8)
+            boxes_px.append(cand)
+            bboxes = list(bboxes) + [_px_to_yolo(cand, W, H)]
+            classes = list(classes) + [int(cls)]
+            n_done += 1
+        return out, bboxes, classes, n_done
+
+
+def _yolo_to_px(b, W, H):
+    cx, cy, w, h = b
+    return ((cx - w / 2) * W, (cy - h / 2) * H, (cx + w / 2) * W, (cy + h / 2) * H)
+
+
+def _px_to_yolo(b, W, H):
+    x1, y1, x2, y2 = b
+    return [min(max((x1 + x2) / 2 / W, 0.0), 1.0), min(max((y1 + y2) / 2 / H, 0.0), 1.0),
+            min((x2 - x1) / W, 1.0), min((y2 - y1) / H, 1.0)]
+
+
+def _overlap(a, b, margin):
+    return not (a[2] + margin <= b[0] or b[2] + margin <= a[0] or a[3] + margin <= b[1] or b[3] + margin <= a[1])
+
+
+def _feather_mask(h, w, feather):
+    """Masque alpha : 1 au centre, descend progressivement à 0 sur une bordure de `feather` × taille."""
+    if feather <= 0:
+        return np.ones((h, w), np.float32)
+    fy, fx = max(1.0, feather * h), max(1.0, feather * w)
+    ys = np.minimum(np.arange(h) + 0.5, h - np.arange(h) - 0.5) / fy
+    xs = np.minimum(np.arange(w) + 0.5, w - np.arange(w) - 0.5) / fx
+    return np.clip(np.minimum.outer(ys, xs), 0, 1).astype(np.float32)
+
+
+# ----------------------------------------------------------------------------------------------
 # Génération
 # ----------------------------------------------------------------------------------------------
-def _apply(img, it, name, rep, attempt, cfg):
-    """Retourne (image, boîtes, classes, secondaire ou None)."""
+def _apply(img, it, name, rep, attempt, cfg, cp_ctx=None, src_index=None):
+    """Retourne (image, boîtes, classes, secondaire ou None, nb de lésions collées)."""
     h, w = img.shape[:2]
+    bboxes, classes, n_pasted = it["bboxes"], it["classes"], 0
+    if cp_ctx is not None and name == EXTRA_D4_AFFINE:
+        # décision de coller : indépendante de l'essai (sinon les nouveaux essais biaisent cp_prob)
+        decide = random.Random(sample_seed(cfg.seed, it["stem"], "copy_paste_decision", rep, 0)).random()
+        rng = random.Random(sample_seed(cfg.seed, it["stem"], "copy_paste", rep, attempt))
+        cls = cp_ctx.target_class(it)
+        if cls is not None and decide < cfg.cp_prob:
+            img, bboxes, classes, n_pasted = cp_ctx.paste(img, bboxes, classes, src_index, cls, rng)
     second = secondary_transform(it["stem"], name, rep, attempt, cfg)
     tf = build_transform((name, second) if second else name, h, w, cfg)
     tf.set_random_seed(sample_seed(cfg.seed, it["stem"], name, rep, attempt))
-    out = tf(image=img, bboxes=it["bboxes"], class_labels=it["classes"])
-    return out["image"], list(out["bboxes"]), [int(c) for c in out["class_labels"]], second
+    out = tf(image=img, bboxes=bboxes, class_labels=classes)
+    return out["image"], list(out["bboxes"]), [int(c) for c in out["class_labels"]], second, n_pasted
 
 
 def generate(cfg: AlignedAugConfig):
@@ -351,10 +480,11 @@ def generate(cfg: AlignedAugConfig):
     os.makedirs(cfg.out_images_dir, exist_ok=True)
     os.makedirs(cfg.out_labels_dir, exist_ok=True)
 
-    if cfg.extra_mode not in ("repeat", "d4_affine"):
-        raise ValueError(f"extra_mode inconnu : {cfg.extra_mode!r} (attendu 'repeat' ou 'd4_affine').")
-    if cfg.extra_mode == "d4_affine" and cfg.combine:
-        raise ValueError("extra_mode='d4_affine' et combine=True sont deux ablations distinctes : choisir l'une.")
+    if cfg.extra_mode not in ("repeat", "d4_affine", "d4_affine_cp"):
+        raise ValueError(f"extra_mode inconnu : {cfg.extra_mode!r} (attendu 'repeat', 'd4_affine' ou 'd4_affine_cp').")
+    if cfg.extra_mode != "repeat" and cfg.combine:
+        raise ValueError("extra_mode='d4_affine…' et combine=True sont deux ablations distinctes : choisir l'une.")
+    schedule_mode = "d4_affine" if cfg.extra_mode.startswith("d4_affine") else "repeat"
 
     items = load_items(cfg)
     n_src = len(items)
@@ -364,6 +494,9 @@ def generate(cfg: AlignedAugConfig):
     boost_ids = resolve_boost_classes(cfg.boost_classes, cfg.class_names)
     weights, n_img_per_class = image_weights(items, cfg.alpha, boost_ids)
     k = allocate(weights, budget, k_max, rng)
+    cp_ctx = (CopyPasteContext(items, boost_ids, n_img_per_class, cfg)
+              if cfg.extra_mode == "d4_affine_cp" else None)
+    pasted_counts = Counter()
 
     before = Counter(c for it in items for c in it["classes"])
     after = Counter(before) if cfg.copy_originals else Counter()
@@ -372,7 +505,7 @@ def generate(cfg: AlignedAugConfig):
     manifest = []
     n_dup_written, n_rejected = 0, 0
 
-    for it, k_i in zip(items, k):
+    for src_index, (it, k_i) in enumerate(zip(items, k)):
         src_path = os.path.join(cfg.images_dir, it["name"])
         if cfg.copy_originals:
             shutil.copy(src_path, os.path.join(cfg.out_images_dir, it["name"]))
@@ -390,15 +523,15 @@ def generate(cfg: AlignedAugConfig):
         seen = {hashlib.md5(img.tobytes()).hexdigest()}
         had_boxes = len(it["bboxes"]) > 0
 
-        for name, rep in transform_schedule(it["stem"], int(k_i), cfg.seed, cfg.extra_mode):
+        for name, rep in transform_schedule(it["stem"], int(k_i), cfg.seed, schedule_mode):
             candidates = retry_candidates(it["stem"], name, rep, cfg.seed)
             written, logged, last_status = False, False, "exhausted"
             for attempt, cand in enumerate(candidates):
                 if attempt > 0 and not (cfg.dedupe or cfg.retry_failed):
                     break
-                status, second = "ok", None
+                status, second, n_pasted = "ok", None, 0
                 try:
-                    aug, bxs, cls, second = _apply(img, it, cand, rep, attempt, cfg)
+                    aug, bxs, cls, second, n_pasted = _apply(img, it, cand, rep, attempt, cfg, cp_ctx, src_index)
                 except Exception as e:  # noqa: BLE001 — même comportement que le script naïf
                     status, aug = f"error:{type(e).__name__}", None
                 if aug is not None and had_boxes and len(bxs) == 0:
@@ -421,6 +554,9 @@ def generate(cfg: AlignedAugConfig):
                 n_dup_written += int(is_dup)
 
                 combo = f"{cand}+{second}" if second else cand
+                if n_pasted:
+                    combo += "+cp"
+                    pasted_counts[cp_ctx.target_class(it)] += n_pasted
                 out_stem = f"{it['stem']}_{combo}_r{rep}" + (f"_a{attempt}" if attempt else "")
                 cv2.imwrite(os.path.join(cfg.out_images_dir, out_stem + ".jpg"),
                             cv2.cvtColor(aug, cv2.COLOR_RGB2BGR),
@@ -443,6 +579,8 @@ def generate(cfg: AlignedAugConfig):
     summary = _summarize(cfg, items, k, budget, k_max, n_img_per_class,
                          before, after, transform_counts, manifest, n_dup_written, n_rejected)
     summary["pair_counts"] = dict(sorted(pair_counts.items()))
+    names_ = cfg.class_names or {}
+    summary["pasted_lesions"] = {names_.get(c, str(c)): n for c, n in sorted(pasted_counts.items())}
     _write_reports(cfg, manifest, summary)
     return summary
 
@@ -502,3 +640,5 @@ def print_summary(s):
     print("Transformations :", s["transform_counts"])
     if s.get("pair_counts"):
         print("Combinaisons (principale+secondaire) :", s["pair_counts"])
+    if s.get("pasted_lesions"):
+        print("Lésions collées (copy-paste) :", s["pasted_lesions"])
