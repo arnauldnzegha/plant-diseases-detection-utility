@@ -122,22 +122,6 @@ def resolve_targets(ocfg, before):
     return targets
 
 
-def compute_class_weights(counts, ocfg):
-    """Poids de classe pour une focal loss / BCE pondérée (calculés sur la distribution fournie).
-    Renvoie deux variantes, ORDONNÉES PAR id de classe (prêtes à passer à une perte) :
-      - inverse-fréquence, normalisée (moyenne = 1) ;
-      - 'effective number of samples' (Cui et al., 2019), normalisée.
-    L'effective-number est plus douce quand une classe est extrêmement rare (évite des poids démesurés)."""
-    ids = sorted(ocfg.class_names)
-    n = np.array([max(1, counts.get(i, 0)) for i in ids], dtype=np.float64)
-    inv = n.sum() / (len(ids) * n)
-    inv = inv / inv.mean()
-    beta = ocfg.beta_effective
-    eff = (1.0 - beta) / (1.0 - np.power(beta, n))
-    eff = eff / eff.mean()
-    return ids, inv, eff
-
-
 def build_rare_pool(items, rare_class_ids):
     """Liste de (img_path, box_n, class) pour le Copy-Paste."""
     rare = set(rare_class_ids)
@@ -186,12 +170,7 @@ def write_sample(out_img_dir, out_lbl_dir, name, img, boxes_n, labels):
     else:
         open(lp, "w").close()
 
-def clip_bboxes(bboxes):
-    """Remet les bboxes dans [0, 1]"""
-    bboxes = np.array(bboxes)
-    bboxes[:, [0, 2]] = np.clip(bboxes[:, [0, 2]], 0, 1)  # x_min, x_max
-    bboxes[:, [1, 3]] = np.clip(bboxes[:, [1, 3]], 0, 1)  # y_min, y_max
-    return bboxes
+
 
 
 def generate(ocfg: OfflineConfig, acfg: AugConfig):
@@ -290,19 +269,6 @@ def report(before, after, ocfg):
         f.write("\n".join(lines))
     print("\nRapport distribution :", csv_path)
     print("\n".join(lines))
-
-    # --- poids de classe, calculés sur la distribution APRÈS (celle sur laquelle on entraîne) ---
-    ids, inv, eff = compute_class_weights(after, ocfg)
-    wlines = ["id,classe,instances_apres,poids_inv_freq,poids_effective_num"]
-    for i, idc in enumerate(ids):
-        wlines.append(f"{idc},{names.get(idc, idc)},{after.get(idc, 0)},{inv[i]:.4f},{eff[i]:.4f}")
-    w_csv = os.path.join(out_dir, "class_weights.csv")
-    with open(w_csv, "w") as f:
-        f.write("\n".join(wlines))
-    print("\nPoids de classe :", w_csv)
-    print("  ordre = id de classe", [names.get(i, i) for i in ids])
-    print("  inverse-fréquence :", [round(float(x), 3) for x in inv])
-    print("  effective-number  :", [round(float(x), 3) for x in eff])
 
     try:
         import matplotlib
