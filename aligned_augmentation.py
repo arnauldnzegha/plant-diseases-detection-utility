@@ -49,6 +49,17 @@ Avec les défauts, une image qui reçoit 7 copies ou moins (toute la DA naïve) 
 l'ablation ne touche que les images qui reçoivent plus de 7 copies.
 combine_from_rep=0 et combine_exclude=() donnent la combinaison sur toutes les copies.
 
+Mode complément D4 + Affine (`extra_mode="d4_affine"`, ablation)
+-----------------------------------------------------------------
+Les 7 premières copies d'une image utilisent les 7 transformations du catalogue (comme le naïf).
+Les copies 8 et suivantes sont toutes « d4_affine » : D4 (une des 8 symétries du carré, boîtes exactes)
+puis un Affine léger (rotation ±affine_rotate, échelle affine_scale, cisaillement ±affine_shear),
+SANS transformation de couleur. Défauts : rotation ±5°, échelle 0,9–1,1, pas de cisaillement,
+rotate_method="largest_box" (la boîte englobe toujours toute la lésion ; aire agrandie de 17 % au plus).
+"ellipse" donne des boîtes serrées mais suppose une lésion elliptique : à éviter pour des lésions irrégulières.
+Les images de 7 copies ou moins (tout le naïf) sont identiques au mode simple.
+Incompatible avec combine=True (deux ablations distinctes).
+
 Boîtes : format YOLO, min_visibility = 0.2. Une copie qui perd toutes ses boîtes (alors que l'image
 source en avait) est rejetée, comme dans le script naïf d'origine.
 
@@ -95,6 +106,7 @@ GEOMETRIC = ("rotate", "random_rotate90", "horizontal_flip", "vertical_flip", "r
 COLOR = ("rgb_shift", "brightness_contrast")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 N_SAME_TRANSFORM_RETRIES = 3
+EXTRA_D4_AFFINE = "d4_affine"   # transformation de complément (extra_mode="d4_affine")
 
 
 # ----------------------------------------------------------------------------------------------
@@ -116,6 +128,12 @@ class AlignedAugConfig:
     combine: bool = False                 # ablation : + 1 transformation de l'autre famille par copie
     combine_from_rep: int = 1             # 1 = combiner seulement à partir de la 8e copie
     combine_exclude: tuple = ("rotate",)  # transformations jamais combinées (ni principale ni secondaire)
+    extra_mode: str = "repeat"            # copies au-delà de 7 : "repeat" (cycle des 7) ou "d4_affine"
+    affine_rotate: float = 5.0            # d4_affine : rotation ±5° (largest_box : aire des boîtes ≤ ×1,17)
+    affine_scale: tuple = (0.9, 1.1)      # d4_affine : échelle (boîtes exactes)
+    affine_shear: float = 0.0             # d4_affine : cisaillement (0 = désactivé ; 5° -> aire ×1,18)
+    affine_rotate_method: str = "largest_box"  # "largest_box" : ne coupe jamais l'objet (boîte plus lâche)
+                                               # "ellipse" : boîte serrée mais suppose un objet elliptique
     copy_originals: bool = True
     dedupe: bool = False
     retry_failed: bool = False
@@ -144,7 +162,8 @@ def build_transform(names, img_h: int, img_w: int, cfg: AlignedAugConfig) -> A.C
 def secondary_transform(stem: str, name: str, rep: int, attempt: int, cfg) -> str | None:
     """Transformation secondaire (mode combiné), tirée dans l'autre famille de façon déterministe.
     None si la copie ne doit pas être combinée (répétition trop basse ou transformation exclue)."""
-    if not cfg.combine or rep < cfg.combine_from_rep or name in cfg.combine_exclude:
+    if (not cfg.combine or rep < cfg.combine_from_rep or name in cfg.combine_exclude
+            or name == EXTRA_D4_AFFINE):
         return None
     family = [t for t in (GEOMETRIC if name in COLOR else COLOR) if t not in cfg.combine_exclude]
     if not family:
@@ -167,6 +186,15 @@ def _single_transform(name: str, img_h: int, img_w: int, cfg: AlignedAugConfig):
         t = A.VerticalFlip(p=1.0)
     elif name == "random_crop":
         t = A.RandomCrop(height=int(img_h * cfg.crop_fraction), width=int(img_w * cfg.crop_fraction), p=1.0)
+    elif name == EXTRA_D4_AFFINE:
+        # D4 (8 symétries du carré, boîtes exactes) puis Affine léger, sans couleur.
+        # largest_box (défaut) : la boîte englobe toujours tout l'objet tourné (un peu plus lâche).
+        t = A.Sequential([
+            A.D4(p=1.0),
+            A.Affine(rotate=(-cfg.affine_rotate, cfg.affine_rotate), scale=cfg.affine_scale,
+                     shear=(-cfg.affine_shear, cfg.affine_shear), rotate_method=cfg.affine_rotate_method,
+                     border_mode=cv2.BORDER_CONSTANT, fill=0, p=1.0),
+        ])
     else:
         raise ValueError(f"Transformation inconnue : {name}")
     return t
@@ -279,13 +307,18 @@ def allocate(weights: np.ndarray, budget: int, k_max: int, rng: random.Random) -
     return k
 
 
-def transform_schedule(stem: str, k: int, seed: int):
+def transform_schedule(stem: str, k: int, seed: int, extra_mode: str = "repeat"):
     """Liste des (transformation, répétition) pour une image : on parcourt les 7 transformations
-    dans un ordre mélangé propre à l'image, puis on recommence si k > 7.
-    Avec k = 7 (naïf), chaque image reçoit chaque transformation exactement une fois."""
+    dans un ordre mélangé propre à l'image, puis, si k > 7 :
+      * extra_mode="repeat"    : on recommence le cycle des 7 (défaut) ;
+      * extra_mode="d4_affine" : les copies 8..k sont toutes "d4_affine" (répétitions 1..k-7).
+    Avec k <= 7 (tout le naïf), le calendrier est identique dans les deux modes."""
     order = list(TRANSFORM_NAMES)
     random.Random(sample_seed(seed, stem, "order", 0, 0)).shuffle(order)
-    return [(order[r % len(order)], r // len(order)) for r in range(k)]
+    n = len(order)
+    if extra_mode == "d4_affine":
+        return [(order[r], 0) if r < n else (EXTRA_D4_AFFINE, r - n + 1) for r in range(k)]
+    return [(order[r % n], r // n) for r in range(k)]
 
 
 def retry_candidates(stem: str, name: str, rep: int, seed: int):
@@ -293,6 +326,8 @@ def retry_candidates(stem: str, name: str, rep: int, seed: int):
     d'abord la transformation prévue, retentée avec de nouvelles graines (corrige par ex. le
     RandomRotate90 qui tire 0°), puis les 6 autres dans un ordre aléatoire propre à la copie
     (pas de biais systématique vers une transformation de repli)."""
+    if name == EXTRA_D4_AFFINE:  # transformation continue : de nouvelles graines suffisent
+        return [name] * (N_SAME_TRANSFORM_RETRIES + len(TRANSFORM_NAMES))
     others = [t for t in TRANSFORM_NAMES if t != name]
     random.Random(sample_seed(seed, stem, name, rep, -1)).shuffle(others)
     return [name] * N_SAME_TRANSFORM_RETRIES + others
@@ -315,6 +350,11 @@ def generate(cfg: AlignedAugConfig):
     rng = random.Random(cfg.seed)
     os.makedirs(cfg.out_images_dir, exist_ok=True)
     os.makedirs(cfg.out_labels_dir, exist_ok=True)
+
+    if cfg.extra_mode not in ("repeat", "d4_affine"):
+        raise ValueError(f"extra_mode inconnu : {cfg.extra_mode!r} (attendu 'repeat' ou 'd4_affine').")
+    if cfg.extra_mode == "d4_affine" and cfg.combine:
+        raise ValueError("extra_mode='d4_affine' et combine=True sont deux ablations distinctes : choisir l'une.")
 
     items = load_items(cfg)
     n_src = len(items)
@@ -350,7 +390,7 @@ def generate(cfg: AlignedAugConfig):
         seen = {hashlib.md5(img.tobytes()).hexdigest()}
         had_boxes = len(it["bboxes"]) > 0
 
-        for name, rep in transform_schedule(it["stem"], int(k_i), cfg.seed):
+        for name, rep in transform_schedule(it["stem"], int(k_i), cfg.seed, cfg.extra_mode):
             candidates = retry_candidates(it["stem"], name, rep, cfg.seed)
             written, logged, last_status = False, False, "exhausted"
             for attempt, cand in enumerate(candidates):
