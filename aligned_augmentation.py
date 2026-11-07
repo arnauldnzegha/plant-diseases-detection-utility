@@ -1,109 +1,3 @@
-"""
-Augmentation hors-ligne ALIGNÉE : DA naïve et DA class-aware avec EXACTEMENT les mêmes transformations.
-
-Principe (pour une comparaison équitable dans le papier)
---------------------------------------------------------
-Les deux méthodes partagent :
-  * le même catalogue de 7 transformations, avec les mêmes paramètres (ceux du papier source),
-  * la même gestion des boîtes (BboxParams identiques),
-  * le même tirage aléatoire par échantillon (graine dérivée de (seed, image, transformation, répétition)),
-  * le même budget total de copies augmentées,
-  * les mêmes options (dedupe, retry_failed).
-
-Seule la POLITIQUE D'ALLOCATION change, contrôlée par un unique paramètre `alpha` :
-  * alpha = 0  -> chaque image reçoit exactement 7 copies (une par transformation) = DA naïve du papier source.
-  * alpha > 0  -> les copies sont redistribuées vers les images contenant des classes rares (class-aware),
-                  le budget total restant identique.
-
-Poids d'une image i :  w_i = max_{c présente dans i} (n_c) ** (-alpha)
-  où n_c = nombre d'images de train contenant la classe c (l'image "vaut" sa classe la plus rare).
-Avec `boost_classes`, seules les classes listées reçoivent ce poids de rareté ; les autres (et les
-images sans annotation) reçoivent le poids de la classe la plus fréquente. Sans cette option, quand les
-classes les plus rares atteignent k_max, le budget restant se reporte sur la classe rare suivante
-(par ex. Mg), ce qui peut renforcer un biais au lieu de le corriger.
-Les copies k_i sont proportionnelles à w_i, plafonnées à k_max, puis arrondies (plus grands restes)
-de sorte que sum(k_i) == budget exactement.
-
-Les 7 transformations (une seule par copie, p = 1)
---------------------------------------------------
-  rgb_shift            RGBShift(±20, ±20, ±20)
-  brightness_contrast  RandomBrightnessContrast(±0.2, ±0.2)
-  rotate               Rotate(limit=90, bord constant)        (angle aléatoire dans [-90°, 90°])
-  random_rotate90      RandomRotate90                          (peut tirer 0° -> copie identique, cf. `dedupe`)
-  horizontal_flip      HorizontalFlip
-  vertical_flip        VerticalFlip
-  random_crop          RandomCrop(70 % H, 70 % W)               (relatif à la taille de chaque image)
-
-Mode combiné (`combine=True`, ablation)
----------------------------------------
-Chaque copie garde sa transformation PRINCIPALE (même calendrier, mêmes comptes que le mode simple).
-Une copie reçoit en plus UNE transformation SECONDAIRE tirée dans l'autre famille si :
-  * sa répétition est >= combine_from_rep (défaut 1 : les 7 premières copies restent simples,
-    la combinaison ne commence qu'à la 8e copie, une fois les 7 transformations atteintes) ;
-  * sa transformation principale n'est pas dans combine_exclude (défaut : "rotate").
-Familles :
-  * principale géométrique (random_rotate90, flips, random_crop) -> + rgb_shift ou brightness_contrast
-  * principale couleur (rgb_shift, brightness_contrast)          -> + une géométrique hors combine_exclude
-Mêmes paramètres que le mode simple. Ordre d'application : couleur PUIS géométrie.
-Avec les défauts, une image qui reçoit 7 copies ou moins (toute la DA naïve) est IDENTIQUE au mode simple :
-l'ablation ne touche que les images qui reçoivent plus de 7 copies.
-combine_from_rep=0 et combine_exclude=() donnent la combinaison sur toutes les copies.
-
-Mode complément D4 + Affine (`extra_mode="d4_affine"`, ablation)
------------------------------------------------------------------
-Les 7 premières copies d'une image utilisent les 7 transformations du catalogue (comme le naïf).
-Les copies 8 et suivantes sont toutes « d4_affine » : D4 (une des 8 symétries du carré, boîtes exactes)
-puis un Affine léger (rotation ±affine_rotate, échelle affine_scale, cisaillement ±affine_shear),
-SANS transformation de couleur. Défauts : rotation ±5°, échelle 0,9–1,1, pas de cisaillement,
-rotate_method="largest_box" (la boîte englobe toujours toute la lésion ; aire agrandie de 17 % au plus).
-"ellipse" donne des boîtes serrées mais suppose une lésion elliptique : à éviter pour des lésions irrégulières.
-Les images de 7 copies ou moins (tout le naïf) sont identiques au mode simple.
-Incompatible avec combine=True (deux ablations distinctes).
-
-Variante `extra_mode="d4_affine_cp"` : comme d4_affine, et, sur chaque copie d4_affine, avec la
-probabilité cp_prob, collage NON INVASIF d'au plus cp_max_patches lésion(s) AVANT D4 + Affine :
-  * classe collée = classe ciblée (boost_classes) la plus rare présente dans l'image ;
-  * lésion prise dans une AUTRE image du train (jamais val/test), boîte d'origine découpée ;
-  * même taille relative que dans son image d'origine, côté plafonné à cp_max_rel_size ;
-  * bords fondus (cp_feather) ; aucune superposition avec les boîtes existantes (marge cp_margin) :
-    aucune lésion annotée n'est masquée ; sans place libre, on ne colle rien ;
-  * pas de changement de couleur. Les 7 premières copies et tout le naïf restent inchangés.
-Limite : sans masque de segmentation, le patch est rectangulaire et emporte le tissu autour de la lésion.
-
-Catalogue conditionnel aux carences (`swap_classes`, ablation)
---------------------------------------------------------------
-Pour les images contenant au moins une boîte d'une classe de swap_classes (ex. Mg, N, K), les 2
-transformations de couleur du catalogue sont remplacées par les 2 symétries diagonales de D4 :
-  rgb_shift           -> transpose       (symétrie sur la diagonale principale)
-  brightness_contrast -> anti_transpose  (symétrie sur l'anti-diagonale)
-Ces images ne reçoivent donc AUCUNE transformation de couleur hors-ligne ; les autres images gardent le
-catalogue d'origine. La règle s'applique quel que soit alpha.
-S'utilise avec extra_mode="repeat" et combine=False.
-
-Variante `swap_mode="illumination_cycle"` (images de carence uniquement) :
-  * catalogue de 7 : rgb_shift -> shadow (RandomShadow, 1 ombre, n'importe où, assombrissement 20–35 %)
-                     brightness_contrast -> sunflare (RandomSunFlare, n'importe où, rayon 12,5 % du grand côté)
-  * cycle de 10 : les 7 (ordre mélangé propre à l'image), puis transpose, anti_transpose, puis une
-    combinaison « tcc » = RGBShift ±10 + recadrage 70 % + transposition (directe ou anti, au hasard) ;
-    le cycle de 10 recommence ensuite. Une image de carence à k ≤ 7 copies ne reçoit que les 7 premières.
-
-Boîtes : format YOLO, min_visibility = 0.2. Une copie qui perd toutes ses boîtes (alors que l'image
-source en avait) est rejetée, comme dans le script naïf d'origine.
-
-Options partagées par les deux bras (à fixer à la MÊME valeur pour naïf et CA)
-------------------------------------------------------------------------------
-  dedupe       : une copie pixel-identique à l'original ou à une copie déjà produite de la même source
-                 est retentée (même transformation avec une autre graine, puis une autre transformation).
-                 False = fidèle au papier source.
-  retry_failed : une copie rejetée (boîtes perdues / erreur) est retentée de la même façon, pour atteindre
-                 exactement le budget. False = fidèle au papier source.
-
-Avertissement : si une image reçoit plus de 7 copies, les flips reproduisent la même image.
-Avec dedupe=False, ces doublons sont écrits ET comptés dans le rapport ; avec dedupe=True ils sont remplacés.
-
-Testé avec albumentations 2.0.8 (Compose.set_random_seed). Vérifiez votre version.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -135,6 +29,8 @@ COLOR_TO_TRANSPOSE = {"rgb_shift": "transpose", "brightness_contrast": "anti_tra
 # swap_mode="illumination_cycle" : couleur -> éclairage local, puis cycle de 10 avec transpositions + combinaison
 COLOR_TO_ILLUMINATION = {"rgb_shift": "shadow", "brightness_contrast": "sunflare"}
 ILLUMINATION_CYCLE_EXTRA = ("transpose", "anti_transpose", "tcc")
+# swap_mode="transpose_cycle" : après les 7 du naïf, une fois ces 4 transformations, puis les 5 géométriques
+TRANSPOSE_CYCLE_ONCE = ("transpose_rgb_shift", "anti_transpose_bc")
 COLOR = ("rgb_shift", "brightness_contrast")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 N_SAME_TRANSFORM_RETRIES = 3
@@ -167,6 +63,8 @@ class AlignedAugConfig:
     shadow_intensity: tuple = (0.2, 0.35) # illumination_cycle : assombrissement de l'ombre (20 à 35 %)
     sunflare_radius_frac: float = 0.125   # illumination_cycle : rayon du reflet / grand côté (80 px à 640)
     tcc_rgb_shift: int = 10               # illumination_cycle : RGBShift ±10 dans la combinaison
+    tc_rgb_shift: int = 10                # transpose_cycle : RGBShift ±10 avec la transposition
+    tac_bc_limit: float = 0.1             # transpose_cycle : luminosité/contraste ±0,1 avec l'anti-transposition
     affine_rotate: float = 5.0            # d4_affine : rotation ±5° (largest_box : aire des boîtes ≤ ×1,17)
     affine_scale: tuple = (0.9, 1.1)      # d4_affine : échelle (boîtes exactes)
     affine_shear: float = 0.0             # d4_affine : cisaillement (0 = désactivé ; 5° -> aire ×1,18)
@@ -244,6 +142,13 @@ def _single_transform(name: str, img_h: int, img_w: int, cfg: AlignedAugConfig):
     elif name == "sunflare":             # reflet, rayon proportionnel à la taille de l'image
         t = A.RandomSunFlare(flare_roi=(0, 0, 1, 1),
                              src_radius=max(1, int(round(cfg.sunflare_radius_frac * max(img_h, img_w)))), p=1.0)
+    elif name == "transpose_rgb_shift":  # couleur ±tc_rgb_shift puis transposition
+        s = cfg.tc_rgb_shift
+        t = [A.RGBShift(r_shift_limit=s, g_shift_limit=s, b_shift_limit=s, p=1.0), A.Transpose(p=1.0)]
+    elif name == "anti_transpose_bc":    # luminosité/contraste ±tac_bc_limit puis anti-transposition
+        b = cfg.tac_bc_limit
+        t = [A.RandomBrightnessContrast(brightness_limit=b, contrast_limit=b, p=1.0),
+             A.Transpose(p=1.0), A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)]
     elif name in ("tcc_transpose", "tcc_anti_transpose"):
         # combinaison : couleur ±tcc_rgb_shift, recadrage 70 %, puis transposition
         # (recadrage AVANT la transposition : ses dimensions sont celles de l'image d'origine)
@@ -375,25 +280,39 @@ def allocate(weights: np.ndarray, budget: int, k_max: int, rng: random.Random) -
 
 
 def image_catalog(classes, swap_ids, swap_mode="transpose"):
-    """(catalogue de 7, transformations ajoutées en fin de cycle) pour une image.
+    """Plan de transformations d'une image : dict avec
+      catalog     : les 7 transformations des copies 1..7 ;
+      cycle_extra : ajoutées à la fin de chaque cycle (cycle répété) ;
+      once_extra  : ajoutées une seule fois après les 7 premières ;
+      tail        : si non vide, après once_extra on répète UNIQUEMENT ces transformations ;
+      swapped     : True si l'image est une image de carence traitée par swap_mode.
     Images contenant une classe de swap_ids (carences) :
-      * swap_mode="transpose"          : couleurs -> transpose / anti_transpose ; pas d'ajout.
-      * swap_mode="illumination_cycle" : couleurs -> shadow / sunflare ; cycle de 10 =
-                                         7 du catalogue + transpose + anti_transpose + combinaison tcc.
-    Autres images : catalogue du naïf, pas d'ajout."""
+      * "transpose"          : couleurs -> transpose / anti_transpose ; cycle des 7 répété.
+      * "illumination_cycle" : couleurs -> shadow / sunflare ; cycle de 10 répété =
+                               7 + transpose + anti_transpose + combinaison tcc.
+      * "transpose_cycle"    : 7 du naïf (identiques) ; puis une fois transpose + rgb_shift ±10 et
+                               anti_transpose + brightness_contrast ±0,1 ; puis les 5 géométriques en boucle.
+    Autres images : catalogue du naïf, cycle des 7 répété."""
+    plan = dict(catalog=TRANSFORM_NAMES, cycle_extra=(), once_extra=(), tail=(), swapped=False)
     if swap_ids and set(classes) & swap_ids:
+        plan["swapped"] = True
         if swap_mode == "illumination_cycle":
-            return tuple(COLOR_TO_ILLUMINATION.get(t, t) for t in TRANSFORM_NAMES), ILLUMINATION_CYCLE_EXTRA
-        return tuple(COLOR_TO_TRANSPOSE.get(t, t) for t in TRANSFORM_NAMES), ()
-    return TRANSFORM_NAMES, ()
+            plan.update(catalog=tuple(COLOR_TO_ILLUMINATION.get(t, t) for t in TRANSFORM_NAMES),
+                        cycle_extra=ILLUMINATION_CYCLE_EXTRA)
+        elif swap_mode == "transpose_cycle":
+            plan.update(once_extra=TRANSPOSE_CYCLE_ONCE, tail=GEOMETRIC)
+        else:
+            plan.update(catalog=tuple(COLOR_TO_TRANSPOSE.get(t, t) for t in TRANSFORM_NAMES))
+    return plan
 
 
 def transform_schedule(stem: str, k: int, seed: int, extra_mode: str = "repeat", catalog=TRANSFORM_NAMES,
-                       cycle_extra=()):
+                       cycle_extra=(), once_extra=(), tail=()):
     """Liste des (transformation, répétition) pour une image : on parcourt les 7 transformations du
     catalogue de l'image dans un ordre mélangé propre à l'image, puis, si k > 7 :
       * extra_mode="repeat"    : on recommence le cycle (défaut). Avec cycle_extra, le cycle est
-                                 [7 du catalogue mélangés] + cycle_extra (ex. cycle de 10) ;
+                                 [7 du catalogue mélangés] + cycle_extra (ex. cycle de 10).
+                                 Avec once_extra / tail : 7, puis once_extra une fois, puis tail en boucle ;
       * extra_mode="d4_affine" : les copies 8..k sont toutes "d4_affine" (répétitions 1..k-7).
     Avec k <= 7 (tout le naïf), le calendrier est identique dans tous les modes."""
     order = list(catalog)
@@ -401,6 +320,14 @@ def transform_schedule(stem: str, k: int, seed: int, extra_mode: str = "repeat",
     n = len(order)
     if extra_mode == "d4_affine":
         return [(order[r], 0) if r < n else (EXTRA_D4_AFFINE, r - n + 1) for r in range(k)]
+    if tail:
+        seq = [(t, 0) for t in order] + [(t, 0) for t in once_extra]
+        tail_order = [t for t in order if t in tail]   # même ordre que les 7 premières
+        j = 0
+        while len(seq) < k:
+            seq.append((tail_order[j % len(tail_order)], 1 + j // len(tail_order)))
+            j += 1
+        return seq[:k]
     cycle = order + list(cycle_extra)
     L = len(cycle)
     out = []
@@ -569,8 +496,9 @@ def generate(cfg: AlignedAugConfig):
 
     boost_ids = resolve_boost_classes(cfg.boost_classes, cfg.class_names)
     swap_ids = resolve_boost_classes(cfg.swap_classes, cfg.class_names)
-    if cfg.swap_mode not in ("transpose", "illumination_cycle"):
-        raise ValueError(f"swap_mode inconnu : {cfg.swap_mode!r} (attendu 'transpose' ou 'illumination_cycle').")
+    if cfg.swap_mode not in ("transpose", "illumination_cycle", "transpose_cycle"):
+        raise ValueError(f"swap_mode inconnu : {cfg.swap_mode!r} "
+                         "(attendu 'transpose', 'illumination_cycle' ou 'transpose_cycle').")
     if swap_ids and (cfg.combine or cfg.extra_mode != "repeat"):
         raise ValueError("swap_classes s'utilise avec extra_mode='repeat' et combine=False.")
     weights, n_img_per_class = image_weights(items, cfg.alpha, boost_ids)
@@ -605,10 +533,14 @@ def generate(cfg: AlignedAugConfig):
         seen = {hashlib.md5(img.tobytes()).hexdigest()}
         had_boxes = len(it["bboxes"]) > 0
 
-        catalog, cycle_extra = image_catalog(it["classes"], swap_ids, cfg.swap_mode)
-        n_swapped_images += catalog != TRANSFORM_NAMES
-        for name, rep in transform_schedule(it["stem"], int(k_i), cfg.seed, schedule_mode, catalog, cycle_extra):
-            candidates = retry_candidates(it["stem"], name, rep, cfg.seed, catalog)
+        plan = image_catalog(it["classes"], swap_ids, cfg.swap_mode)
+        catalog = plan["catalog"]
+        n_swapped_images += plan["swapped"]
+        for name, rep in transform_schedule(it["stem"], int(k_i), cfg.seed, schedule_mode, catalog,
+                                            plan["cycle_extra"], plan["once_extra"], plan["tail"]):
+            # copies de la boucle finale (tail) : replis pris uniquement dans la tail (pas de couleur)
+            retry_cat = plan["tail"] if (plan["tail"] and rep >= 1) else catalog
+            candidates = retry_candidates(it["stem"], name, rep, cfg.seed, retry_cat)
             written, logged, last_status = False, False, "exhausted"
             for attempt, cand in enumerate(candidates):
                 if attempt > 0 and not (cfg.dedupe or cfg.retry_failed):
