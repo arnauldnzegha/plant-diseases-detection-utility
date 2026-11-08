@@ -1,54 +1,3 @@
-"""
-Augmentation hors-ligne ALIGNÉE : DA naïve et DA class-aware (CA) avec les mêmes transformations.
-
-Trois configurations
---------------------
-  1. Naïf        : alpha = 0      -> chaque image reçoit exactement 7 copies (une par transformation).
-  2. CA          : alpha > 0      -> le même budget total est redistribué vers les images des classes
-                                     ciblées (boost_classes), plafonné à k_max copies par image.
-  3. CA + swap   : CA avec swap_mode="transpose_cycle" -> calendrier modifié pour les images de carence
-                                     (swap_classes) qui reçoivent plus de 7 copies.
-
-Les 7 transformations (une seule par copie, p = 1) — celles du papier source
------------------------------------------------------------------------------
-  rgb_shift            RGBShift(±20, ±20, ±20)
-  brightness_contrast  RandomBrightnessContrast(±0.2, ±0.2)
-  rotate               Rotate(limit=90, bord constant)        (angle aléatoire dans [-90°, 90°])
-  random_rotate90      RandomRotate90                          (0°, 90°, 180° ou 270°)
-  horizontal_flip      HorizontalFlip
-  vertical_flip        VerticalFlip
-  random_crop          RandomCrop(70 % H, 70 % W)
-
-Allocation (seule différence entre naïf et CA)
------------------------------------------------
-Poids d'une image : w = max sur ses classes ciblées de n_c ** (-alpha), où n_c = nombre d'images de train
-contenant la classe c ; les autres classes (et les images sans annotation) reçoivent le poids de la classe la
-plus fréquente. Les copies sont proportionnelles à w, plafonnées à k_max, arrondies pour que leur somme soit
-exactement le budget (7 × nombre d'images par défaut, comme le naïf).
-
-Calendrier des copies d'une image
----------------------------------
-Les 7 transformations dans un ordre mélangé propre à l'image ; au-delà de 7 copies, le cycle recommence
-(nouvelle graine à chaque passage). Avec 7 copies (naïf), chaque transformation est appliquée une fois.
-
-Option swap_mode="transpose_cycle" (images contenant au moins une boîte de swap_classes, ex. Mg, N, K)
-------------------------------------------------------------------------------------------------------
-  copies 1–7  : les 7 du naïf, IDENTIQUES au naïf ;
-  copie 8     : transposition + RGBShift ±tc_rgb_shift ;
-  copie 9     : anti-transposition + luminosité/contraste ±tac_bc_limit ;
-  copies 10+  : les 5 transformations géométriques seulement (rotate, random_rotate90, flips, random_crop),
-                en boucle. Les replis (dedupe / retry_failed) y sont pris parmi ces 5 : aucune couleur.
-Une image de carence avec 7 copies ou moins est donc identique au naïf. Les autres images ne changent pas.
-
-Options communes (même valeur dans tous les bras)
--------------------------------------------------
-  dedupe       : une copie identique au pixel près à l'original ou à une copie déjà produite de la même image
-                 est refaite (même transformation, autre graine ; puis une autre transformation).
-  retry_failed : une copie rejetée (toutes les boîtes perdues, erreur) est refaite de la même façon.
-Boîtes : format YOLO, min_visibility = 0.2.
-
-Testé avec albumentations 2.0.8 (Compose.set_random_seed). Vérifiez votre version.
-"""
 
 from __future__ import annotations
 
@@ -67,15 +16,6 @@ import cv2
 import numpy as np
 
 TRANSFORM_NAMES = (
-    "rgb_shift",
-    "brightness_contrast",
-    "rotate",
-    "random_rotate90",
-    "horizontal_flip",
-    "vertical_flip",
-    "random_crop",
-)
-TRANSFORM_NAMES2 = (
     "rgb_shift",
     "brightness_contrast",
     "rotate",
@@ -113,11 +53,11 @@ class AlignedAugConfig:
     tac_bc_limit: float = 0.5             # copie 9 : luminosité/contraste ±0,5 avec l'anti-transposition
 
     copy_originals: bool = True
-    dedupe: bool = True
-    retry_failed: bool = True
+    dedupe: bool = False
+    retry_failed: bool = False
     min_visibility: float = 0.2
     crop_fraction: float = 0.7
-    seed: int = 123
+    seed: int = 42
     jpeg_quality: int = 95
 
 
@@ -263,11 +203,10 @@ def transform_schedule(stem: str, k: int, seed: int, swapped: bool = False):
     swapped : les 7, puis transpose_rgb_shift, anti_transpose_bc, puis les 5 géométriques en boucle
               (dans le même ordre que pour les 7 premières)."""
     order = list(TRANSFORM_NAMES)
-    order2 = list(TRANSFORM_NAMES2)
     random.Random(sample_seed(seed, stem, "order", 0, 0)).shuffle(order)
     n = len(order)
     if not swapped:
-        return [(order2[r % n], r // n) for r in range(k)]
+        return [(order[r % n], r // n) for r in range(k)]
     seq = [(t, 0) for t in order] + [(t, 0) for t in TRANSPOSE_CYCLE_ONCE]
     tail = [t for t in order if t in GEOMETRIC]
     j = 0
