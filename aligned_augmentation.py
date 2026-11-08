@@ -82,7 +82,7 @@ TRANSFORM_NAMES2 = (
     "random_rotate90",
     "horizontal_flip",
     "vertical_flip",
-    "rotate",
+    "random_crop",
 )
 GEOMETRIC = ("rotate", "random_rotate90", "horizontal_flip", "vertical_flip", "random_crop")
 CONTINUOUS = ("rotate", "random_crop")                      # toujours une copie nouvelle (derniers recours)
