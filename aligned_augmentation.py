@@ -17,12 +17,12 @@ import numpy as np
 
 TRANSFORM_NAMES = (
     "rgb_shift",
-    "brightness_contrast",
+    "random_crop",
     "rotate",
     "random_rotate90",
     "horizontal_flip",
     "vertical_flip",
-    "random_crop",
+    "brightness_contrast",
 )
 
 TRANSFORM_NAMES2 = (
