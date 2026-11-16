@@ -34,6 +34,7 @@ TRANSFORM_NAMES2 = (
     "vertical_flip",
     "random_crop",
 )
+
 GEOMETRIC = ("rotate", "random_rotate90", "horizontal_flip", "vertical_flip", "random_crop")
 CONTINUOUS = ("rotate", "random_crop")                      # toujours une copie nouvelle (derniers recours)
 TRANSPOSE_CYCLE_ONCE = ("transpose_rgb_shift", "anti_transpose_bc")
@@ -213,7 +214,7 @@ def transform_schedule(stem: str, k: int, seed: int, swapped: bool = False):
     swapped : les 7, puis transpose_rgb_shift, anti_transpose_bc, puis les 5 géométriques en boucle
               (dans le même ordre que pour les 7 premières)."""
     order = list(TRANSFORM_NAMES)
-    order2 = list(TRANSFORM_NAMES2)
+    order2 = list(TRANSFORM_NAMES)
     random.Random(sample_seed(seed, stem, "order", 0, 0)).shuffle(order)
     n = len(order)
     if not swapped:
