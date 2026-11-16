@@ -22,7 +22,7 @@ TRANSFORM_NAMES = (
     "random_rotate90",
     "horizontal_flip",
     "vertical_flip",
-    "random_rotate90",
+    "random_crop",
 )
 
 TRANSFORM_NAMES2 = (
